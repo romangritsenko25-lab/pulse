@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { createClient } from '@/lib/supabase/client'
 
 // ── Types ──────────────────────────────────────────────────────────────────
 interface FormData {
@@ -199,16 +200,48 @@ export default function CheckinPage() {
     setLoading(true)
     setError('')
     try {
+      const supabase = createClient()
+
+      // 1. Verify active session
+      const { data: { user }, error: authError } = await supabase.auth.getUser()
+      if (authError || !user) {
+        router.push('/login')
+        return
+      }
+
+      // 2. INSERT checkin into Supabase
+      const { data: checkin, error: insertError } = await supabase
+        .from('checkins')
+        .insert({
+          user_id: user.id,
+          wellbeing: form.wellbeing,
+          sleep: form.sleep,
+          energy: form.energy,
+          mood: form.mood || null,
+          notes: form.notes || null,
+        })
+        .select('id')
+        .single()
+
+      if (insertError) {
+        console.error('Checkin insert error:', insertError)
+        setError(`Не удалось сохранить данные: ${insertError.message}`)
+        setLoading(false)
+        return
+      }
+
+      // 3. Get AI analysis (passes checkin_id so route skips duplicate insert)
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(form),
+        body: JSON.stringify({ ...form, checkin_id: checkin.id }),
       })
       if (!res.ok) throw new Error('server_error')
       const data = await res.json()
       sessionStorage.setItem(`pulse_checkin_${data.id}`, JSON.stringify(data))
       router.push(`/result?id=${data.id}`)
-    } catch {
+    } catch (err) {
+      console.error('handleSubmit error:', err)
       setError('Не удалось получить анализ. Проверьте соединение и попробуйте снова.')
       setLoading(false)
     }
