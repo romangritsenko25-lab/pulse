@@ -2,101 +2,138 @@ import { NextRequest, NextResponse } from 'next/server'
 import { anthropic } from '@/lib/anthropic'
 import { createClient } from '@/lib/supabase/server'
 
-const SYSTEM_PROMPT =
-  'Ты AI-ассистент здоровья Pulse. Анализируй данные ' +
-  'дневника самочувствия. Отвечай ТОЛЬКО на русском языке. ' +
-  'Находи паттерны между сном, энергией и настроением. ' +
-  'Называй конкретные цифры из данных. Никогда не ставь ' +
-  'диагноз и не заменяй врача. Пиши 3-4 предложения, ' +
-  'тепло и конкретно. Заканчивай мотивирующей фразой.'
+const SYSTEM_PROMPT = `Ты опытный психолог-консультант который помогает человеку осознать своё состояние перед визитом к специалисту. Отвечай ТОЛЬКО на русском языке. Тон: тёплый, принимающий, без осуждения.
 
-interface CheckinRow {
-  wellbeing: number
-  sleep: string
-  energy: string
-  created_at: string
+Верни ответ СТРОГО в формате JSON (без markdown, без \`\`\`, только чистый JSON):
+{
+  "reflection": "2-3 предложения начиная с 'Из того что ты описал(а)...' — отрази что услышал, назови эмоции",
+  "patterns": "2-3 предложения о повторяющихся связях между физическим и эмоциональным состоянием",
+  "hypothesis": "1-2 предложения, начни с 'Мне интересно, не связано ли это с...' — осторожное предположение в форме вопроса, без диагноза",
+  "forSpecialist": ["тема 1", "тема 2", "тема 3", "тема 4"],
+  "support": "1 завершающая фраза поддержки"
 }
 
-function buildHistoryText(rows: CheckinRow[]): string {
-  if (rows.length === 0) return 'Предыдущих записей нет — это первый чекин.'
-  return rows
-    .map((r) => {
-      const date = new Date(r.created_at).toLocaleDateString('ru-RU', {
-        day: 'numeric',
-        month: 'short',
-      })
-      return `${date}: самочувствие ${r.wellbeing}/10, сон «${r.sleep}», энергия «${r.energy}»`
-    })
-    .join('\n')
+Никогда не ставь диагноз. Если есть явные признаки суицидальных мыслей в данных — верни только: {"crisis": true}`
+
+interface DeepFormData {
+  wellbeing: number
+  wellbeingReason: string
+  sleepHours: number
+  sleepQuality: string
+  sleepIssues: string
+  bodyPains: string[]
+  energyMorning: number
+  energyAfternoon: number
+  energyEvening: number
+  emotions: string[]
+  anxietyLevel: number
+  anxietyAbout: string
+  selfHarm: boolean | null
+  controlFeeling: number
+  memorableMoment: string
+  stressFactors: string[]
+  socialContact: string
+  eating: string
+  substances: string
+  freeText: string
+}
+
+interface AnalysisResult {
+  reflection: string
+  patterns: string
+  hypothesis: string
+  forSpecialist: string[]
+  support: string
+}
+
+function buildPrompt(form: DeepFormData): string {
+  const energyAvg = ((form.energyMorning + form.energyAfternoon + form.energyEvening) / 3).toFixed(1)
+  return `ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:
+
+БЛОК 1 — ТЕЛО:
+- Общее самочувствие: ${form.wellbeing}/10${form.wellbeingReason ? ` ("${form.wellbeingReason}")` : ''}
+- Сон: ${form.sleepHours} ч, качество: ${form.sleepQuality}${form.sleepIssues ? `, мешало: "${form.sleepIssues}"` : ''}
+- Боли/дискомфорт: ${form.bodyPains.length ? form.bodyPains.join(', ') : 'нет'}
+- Энергия: утро ${form.energyMorning}/5, день ${form.energyAfternoon}/5, вечер ${form.energyEvening}/5 (средняя: ${energyAvg}/5)
+
+БЛОК 2 — ЭМОЦИИ:
+- Эмоции: ${form.emotions.length ? form.emotions.join(', ') : 'не указаны'}
+- Тревога: ${form.anxietyLevel}/10${form.anxietyAbout ? ` ("${form.anxietyAbout}")` : ''}
+- Мысли о самоповреждении: ${form.selfHarm === true ? 'да' : 'нет'}
+- Ощущение контроля: ${form.controlFeeling}/10
+- Запомнившийся момент: ${form.memorableMoment || 'не указан'}
+
+БЛОК 3 — КОНТЕКСТ:
+- Стресс-факторы: ${form.stressFactors.length ? form.stressFactors.join(', ') : 'нет'}
+- Социальные контакты: ${form.socialContact || 'не указано'}
+- Питание: ${form.eating || 'не указано'}
+- Алкоголь/вещества: ${form.substances || 'нет'}
+
+БЛОК 4 — СВОБОДНЫЙ РАССКАЗ:
+${form.freeText || '(не заполнен)'}
+
+Проанализируй и верни JSON.`
 }
 
 export async function POST(req: NextRequest) {
-  // checkin_id is set by the client after a successful INSERT
-  const { wellbeing, sleep, energy, mood, notes, checkin_id } = await req.json()
+  const { form, checkin_id } = await req.json() as { form: DeepFormData; checkin_id?: string }
 
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  // Use the id the client already persisted, or a fallback UUID for unauthenticated preview
   const checkinId: string = checkin_id ?? crypto.randomUUID()
-  let historyText = 'Предыдущих записей нет — это первый чекин.'
 
-  if (user && checkin_id) {
-    // Fetch last 6 previous checkins for context (current already inserted by client)
-    const { data: history, error: histErr } = await supabase
-      .from('checkins')
-      .select('wellbeing, sleep, energy, created_at')
-      .eq('user_id', user.id)
-      .neq('id', checkin_id)
-      .order('created_at', { ascending: false })
-      .limit(6)
-
-    if (histErr) console.error('History fetch error:', histErr)
-    historyText = buildHistoryText((history ?? []) as CheckinRow[])
+  // Safety gate — if user flagged self-harm, skip AI and return crisis signal
+  if (form.selfHarm === true) {
+    return NextResponse.json({ id: checkinId, crisis: true })
   }
 
-  // Call Claude
-  let insight = ''
+  let analysis: AnalysisResult = {
+    reflection: '',
+    patterns: '',
+    hypothesis: '',
+    forSpecialist: [],
+    support: '',
+  }
+
   try {
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 400,
+      max_tokens: 800,
       system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: `Сегодняшний чекин:
-- Самочувствие: ${wellbeing}/10
-- Сон: ${sleep}
-- Энергия: ${energy}
-- Настроение: ${mood || 'не указано'}
-- Заметки: ${notes || 'нет'}
-
-История последних дней:
-${historyText}
-
-Дай персональный инсайт.`,
-        },
-      ],
+      messages: [{ role: 'user', content: buildPrompt(form) }],
     })
 
-    insight = message.content[0].type === 'text' ? message.content[0].text : ''
+    const raw = message.content[0].type === 'text' ? message.content[0].text : ''
+    const parsed = JSON.parse(raw)
+
+    if (parsed.crisis) {
+      return NextResponse.json({ id: checkinId, crisis: true })
+    }
+
+    analysis = parsed as AnalysisResult
   } catch (err) {
-    console.error('Claude API error:', err)
-    const levelWord = wellbeing >= 7 ? 'хорошим' : wellbeing >= 5 ? 'умеренным' : 'сложным'
-    insight = `Сегодня ваше самочувствие ${wellbeing}/10 — ${levelWord} день. Сон «${sleep}» и энергия «${energy}» дают ясную картину вашего состояния. Продолжайте фиксировать данные — уже через несколько дней появятся заметные паттерны. Вы молодец, что заботитесь о себе!`
+    console.error('Claude API or parse error:', err)
+    const levelWord = form.wellbeing >= 7 ? 'хорошим' : form.wellbeing >= 5 ? 'умеренным' : 'непростым'
+    analysis = {
+      reflection: `Из того что ты описал(а), видно что сегодня был ${levelWord} день. Твоё самочувствие ${form.wellbeing}/10 и ${form.emotions.length ? `эмоции — ${form.emotions.slice(0, 3).join(', ')}` : 'твоё состояние'} говорят о многом.`,
+      patterns: `Сон ${form.sleepHours} часов и уровень тревоги ${form.anxietyLevel}/10 могут влиять на общий энергетический фон. Стоит обратить внимание на эту связь.`,
+      hypothesis: `Мне интересно, не связано ли это с накопленным напряжением которое ищет выход?`,
+      forSpecialist: ['Общее эмоциональное состояние', 'Качество сна и его влияние', 'Источники стресса', 'Способы справляться с тревогой'],
+      support: 'Ты молодец, что нашёл(а) время разобраться в своём состоянии — это важный шаг к себе.',
+    }
   }
 
-  // UPDATE the row the client inserted with the AI insight
+  // Update DB with structured insight
   if (user && checkin_id) {
     const { error: updateErr } = await supabase
       .from('checkins')
-      .update({ ai_insight: insight })
+      .update({ ai_insight: JSON.stringify(analysis) })
       .eq('id', checkin_id)
-      .eq('user_id', user.id)   // extra guard: only own rows
+      .eq('user_id', user.id)
 
     if (updateErr) console.error('Insight update error:', updateErr)
   }
 
-  return NextResponse.json({ insight, id: checkinId, wellbeing, sleep, energy, mood })
+  return NextResponse.json({ id: checkinId, ...analysis, form })
 }
